@@ -100,6 +100,15 @@ redundant. **Rule: derive, don't co-commit.** When one write must imply
 another, make the second a derivation of the first rather than bolting
 multi-event atomicity onto the store.
 
+**The terminal-status set, enumerated once (everything else references this
+list):** `completed` (all steps completed), any halt-with-status value
+(e.g. `rejected`), `failed` (retry attempts exhausted, or a permanent step
+error), and `budget_exhausted` (the ledger guard tripped, recorded as a
+permanent failure with a budget reason). All are fold-computed; none is a
+distinct event type. Non-terminal states — `pending`, `running`,
+`waiting_retry`, `suspended`, `incompatible` — are waiting for something
+and are never prune-eligible (ADR-17).
+
 ## ADR-4: Step identity is (stepName, attempt); names unique per definition
 
 **Decision.** Every attempt of a step appends its own events; nothing is
@@ -131,6 +140,26 @@ never executes a step inserted before its position: the instance's contract
 is the definition it was created under. If the operator's intent was "all
 in-flight instances must run the new step," that is a data migration, not a
 deploy, and no hash divines intent.
+
+**Worked example (the case that distinguishes the anchors).** Definition
+`[classify, fetch, draft, approve, send]`; an instance is at step 4
+(`approve`); a deploy inserts `sanitize` at position 2. Index-anchoring:
+position 4 in the new definition is now `approve`'s old neighborhood shifted
+— the position-4 comparison mismatches and the instance is stranded, even
+though the change provably cannot affect it (its remaining steps never
+touch `sanitize`). Name-anchoring: find `approve` by name in the new
+definition, compare suffixes from there — `[approve, send]` matches, the
+instance is compatible, and `sanitize` simply never runs for old instances,
+because their contract is the definition they were created under.
+Index-anchoring strands the unstrandable; name-anchoring honors the
+instance's original contract; Loom chooses the contract.
+
+**The anchor-missing edge (the likeliest real-world mismatch).** If the next
+unexecuted step's *name* does not exist in the current definition at all —
+it was renamed or deleted — there is nothing to anchor to, and the instance
+transitions to `incompatible` with a reason naming the missing step. This is
+stated explicitly because renames are more common than structural rewrites,
+and an unstated edge here would be a silent wrong-step execution.
 
 **Stated limitation.** "Compatible" means *structurally* compatible. Step
 bodies — prompts, model choices, logic — are invisible to the hash;
@@ -182,10 +211,15 @@ exists in all deployment modes. Two classes:
   produces while driving an instance — step events, reservations,
   settlements. Guard against zombie executors; stale-epoch appends rejected.
 - **Constrained appends** (epoch-exempt, uniqueness-guarded): events
-  recording **external inputs**. MVP's only member: `StepResumed{decision}`,
-  unique on `(instanceID, stepName, attempt, eventType)`. Safe unfenced
-  because the constraint makes it idempotent-first-wins and the fold only
-  consumes it when suspended at that step.
+  recording **external inputs**. MVP members: `InstanceCreated` (unique on
+  instanceID — the purest recorded external input there is; it necessarily
+  precedes any claim, so no epoch can exist yet, and uniqueness makes
+  duplicate submission idempotent) and `StepResumed{decision}` (unique on
+  `(instanceID, stepName, attempt, eventType)`). Both are safe unfenced for
+  the same reason: the uniqueness constraint makes the append
+  idempotent-first-wins, and the fold only consumes the event from the one
+  state that expects it — `InstanceCreated` only as the log's first event,
+  `StepResumed` only when suspended at that step.
 
 **Why two classes.** A webhook-driven `Resume` has no claim; forcing it to
 claim would fence off a legitimately running executor as a side effect of a
@@ -324,9 +358,21 @@ wf.Step("draft-reply", loom.Typed(DraftReply))
 `json.RawMessage` even though the log stores it. Raw steps are the escape
 hatch, not the default. `ctx context.Context` is the first parameter per Go
 convention — `StepContext` is Loom's surface (deps, prior outputs, LLM
-client, budget) and does **not** wrap ctx. Cross-step references
-(`sctx.Output("classify", &v)`) are validated at definition registration —
-a typo'd step name fails at startup, not in production.
+client, budget) and does **not** wrap ctx.
+
+**Cross-step reads are declared, because registration cannot see inside
+closures.** The builder cannot know which names a step body passes to
+`sctx.Output` at runtime, so reads are declared as data:
+
+```go
+wf.Step("fetch-context", loom.Typed(FetchCtx)).Reads("classify")
+```
+
+Declared reads are validated at registration against existing earlier step
+names (a typo'd name fails at startup); `sctx.Output` for an *undeclared*
+read fails at runtime with an error naming the missing `.Reads(...)`.
+Declared reads are also visible data dependencies — the inspector timeline
+and the replay exporter may consume them later.
 
 **Stated limitation.** Output schema drift between steps remains a runtime
 concern; Go generics cannot express heterogeneous pipeline typing without
@@ -376,7 +422,8 @@ anyone expecting sub-second dispatch.
 
 ## ADR-17: Retention — store.Prune(olderThan), manual, terminal-only
 
-**Decision.** Eligible: terminal instances only (`completed`, `rejected`,
+**Decision.** Eligible: terminal instances only — the ADR-3 terminal set
+(`completed`, halt statuses such as `rejected`, `failed`,
 `budget_exhausted`) — never `suspended` or `incompatible`, which are waiting
 for someone, not done. Explicit operator invocation; no background reaper.
 `Prune` returns a count and appends nothing (the log does not log its own
@@ -407,6 +454,35 @@ problem: Loom exists for teams that want this without adopting a platform.
 
 ---
 
+## Testing strategy
+
+**The canonical crash-recovery test is the first end-to-end deliverable**,
+built before step-type polish or inspector work. It runs the real triage
+example as a **subprocess** and kills it with **SIGKILL** mid-step — not an
+in-process simulateCrash hook, which tests a politeness the real world does
+not have. Sequence: build `examples/triage` as a binary; run it against a
+temp SQLite file; when it signals it is inside the LLM step (after the mock
+call returned, before the append — the worst window), SIGKILL it; start a
+fresh process against the same file; assert from the log that steps 1..N-1
+were **not** re-executed (exactly one `StepStarted` each), the orphaned
+reservation was settled at reserved max with a `crash-orphaned` audit event,
+and execution continued to a terminal `completed` status.
+
+**The zombie-fencing variant is the only real test of ADR-8.** SIGSTOP the
+first process mid-step instead of killing it; start a second process against
+the same file, which claims the instance (epoch bump), settles the orphan,
+and completes the workflow; SIGCONT the zombie; assert its late append is
+**rejected by the store** with a stale-epoch error and that the log contains
+exactly one completion for the contested step. A fencing design that has
+never had its fence hit by a live zombie is a comment, not a guarantee.
+
+Below the end-to-end pair: fold unit tests (prescriptions for halt, retry
+`notBefore`, orphan detection, budget arithmetic, both incompatibility
+edges), store contract tests (fencing, resume uniqueness, prune
+eligibility), and replay-harness tests (truncate-and-rerun with no
+divergence, injected failure, recorded resume decisions replayed from the
+log) — all against the in-memory store, no external services (principle 5).
+
 ## Package layout
 
 ```
@@ -435,7 +511,12 @@ loom/replay/              NewReplayHarness, injection, comparators, exporter-
 loom/inspector/           embedded HTTP UI: timeline, statuses, resume,
                           reservation release, export-as-replay-test (ADR-12)
 
-examples/triage/          flagship demo: classify -> fetch-context -> LLM
+docs/design-grilling.md   condensed transcript of the four-round design
+                          review that produced this register
+
+examples/triage/          own go.mod (replace ../..) — demo dependencies
+                          must not leak into the library's import graph.
+                          flagship demo: classify -> fetch-context -> LLM
                           draft (budget guard) -> approval gate -> send;
                           mock LLM bills realistic tokens (chars/4 + real
                           price table); --crash-at draft hard-exits (os.Exit)
