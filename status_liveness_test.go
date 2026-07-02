@@ -91,6 +91,13 @@ func TestTornStatusWriteStillAcquiredAndCompleted(t *testing.T) {
 // setting status running); the driver's SetStatus(suspended) then overwrites
 // it. Without the driver's park-then-refold, the cache would say suspended
 // (unclaimable) while the log holds a resume — wedged forever.
+//
+// This wrapper is the reusable harness for the ADR-7 re-fold invariant:
+// any future constrained appender racing a park — a durable-timer expiry
+// sweep calling Resume, a suspension-like step type waiting on an external
+// event — is tested the same way: intercept the parking SetStatus, inject
+// the constrained append first, then apply the write. Reuse this pattern;
+// don't reinvent it.
 type racingStore struct {
 	loom.StateStore
 	mu    sync.Mutex

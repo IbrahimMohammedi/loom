@@ -262,6 +262,29 @@ machinery plus a staleness bound) because it prevents the wedge at the
 point of the race instead of repairing it later. Tested by a store wrapper
 that deterministically injects the resume inside the park's write.
 
+**The re-fold invariant (generalized from the fix above).** The root cause
+is structural, not incidental to ApprovalStep: constrained appends are
+unfenced *by design* (that is what makes webhook-driven inputs possible),
+so they can land inside any driver write. The rule, for every current and
+future parking site:
+
+> Any driver write that can move an instance's status toward unclaimable
+> must be followed by one re-fold, because constrained appends are
+> unfenced and can land inside the write.
+
+One re-fold suffices: a constrained append landing before it is seen and
+handled by the continued drive; one landing after it wins the last status
+write (its own atomic `running`) with no subsequent driver write left to
+clobber it. No loop, no sweep. ApprovalStep is merely the only step type
+that parks today; the known future cases that will hit the same wedge if
+this rule is forgotten are **durable timers** (a timer-expiry sweep calling
+`Resume` is a constrained appender racing a park — structurally identical
+to the webhook race) and **any future suspension-like step type** (waiting
+on an external event, a child workflow, a batch callback). The
+deterministic reproduction harness — a store wrapper injecting the
+constrained append inside the park's status write, see
+`status_liveness_test.go` — is reusable for exactly those cases.
+
 **Why two classes.** A webhook-driven `Resume` has no claim; forcing it to
 claim would fence off a legitimately running executor as a side effect of a
 human click. The taxonomy also names "recorded external inputs" as a

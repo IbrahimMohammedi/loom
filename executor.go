@@ -326,6 +326,12 @@ func (d *driver) run(ctx context.Context, id string) error {
 			// before our write and continues the drive; one that lands
 			// after our write wins the cache and the acquisition loop
 			// picks it up. Every interleaving is live.
+			//
+			// This is an instance of the ADR-7 re-fold invariant: any
+			// driver write moving status toward unclaimable must be
+			// followed by one re-fold, because constrained appends are
+			// unfenced and can land inside the write. New parking step
+			// types must do the same.
 			if err := d.store.SetStatus(ctx, id, StatusSuspended, nil); err != nil {
 				return err
 			}
