@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Library module: vet, gofmt, and the full test suite with the race
+  # detector — including e2e/, whose subprocess crash tests
+  # (TestCrashSafeResume: SIGKILL mid-LLM-step; TestZombieFencing:
+  # SIGSTOP/SIGCONT stale-epoch rejection) are the whole point of this CI
+  # and must execute, never skip. They carry //go:build unix, which
+  # ubuntu-latest satisfies. -race instruments only the test processes;
+  # the triage demo subprocess is built separately inside the test, so the
+  # signal timing it depends on is unaffected and no race/no-race split is
+  # needed.
+  library:
+    name: library (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned to go.mod for reproducibility, plus latest stable to catch
+        # upcoming-toolchain breakage early. Never floating-only.
+        go: ["1.25.5", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          # Both modules' sums: the e2e tests `go build` examples/triage
+          # from inside the library test run, so its deps must be cached
+          # (and downloadable) in this job too.
+          cache-dependency-path: |
+            go.sum
+            examples/triage/go.sum
+      - name: gofmt (both modules)
+        run: |
+          diff=$(gofmt -l .)
+          if [ -n "$diff" ]; then
+            echo "gofmt needed on:" && echo "$diff" && exit 1
+          fi
+      - name: vet
+        run: go vet ./...
+      - name: test (full suite, race detector, subprocess crash tests included)
+        run: |
+          set -euo pipefail
+          go test -race -v -timeout 10m ./... | tee test.log
+      - name: assert subprocess crash tests actually ran (not skipped)
+        run: |
+          grep -q -- "--- PASS: TestCrashSafeResume" test.log
+          grep -q -- "--- PASS: TestZombieFencing" test.log
+
+  # Demo module (own go.mod, replace ../..): must compile and vet. It has
+  # no test files of its own; its crash-resume path is exercised by the
+  # library job's e2e tests, which build and signal this binary.
+  example-triage:
+    name: example-triage (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.5", "stable"]
+    defaults:
+      run:
+        working-directory: examples/triage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: examples/triage/go.sum
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...

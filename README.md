@@ -1,4 +1,4 @@
-# Loom
+# Loom [![CI](https://github.com/IbrahimMohammedi/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/IbrahimMohammedi/loom/actions/workflows/ci.yml)
 
 **Durable step orchestration for Go backends, with first-class LLM steps.
 Embeddable: one import, one SQLite file, zero extra infrastructure.**
