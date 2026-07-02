@@ -9,6 +9,7 @@
 //	triage -db state.db approve -id t1
 //	triage -db state.db reject  -id t1
 //	triage -db state.db timeline -id t1
+//	triage -db state.db inspect [-addr :7710]
 //
 // Exit codes: 0 ok (terminal, suspended, or waiting), 1 error,
 // 3 stale epoch (this process's claim was usurped — the fencing working).
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/IbrahimMohammedi/loom"
+	"github.com/IbrahimMohammedi/loom/inspector"
 	"github.com/IbrahimMohammedi/loom/store/sqlite"
 )
 
@@ -35,6 +37,7 @@ func main() {
 	crashAt := fs.String("crash-at", "", "hard-exit inside this step (after its LLM call, before its append)")
 	linger := fs.Duration("linger", 0, "hold the mock LLM call open this long (widens the crash window for tests)")
 	failLarge := fs.Bool("fail-large", false, "simulate the primary model failing with a 529 (falls back to quill-mini)")
+	addr := fs.String("addr", ":7710", "inspector listen address (inspect command)")
 
 	args := os.Args[1:]
 	cmd := "run"
@@ -42,7 +45,7 @@ func main() {
 	var rest []string
 	for _, a := range args {
 		switch a {
-		case "run", "approve", "reject", "timeline":
+		case "run", "approve", "reject", "timeline", "inspect":
 			cmd = a
 		default:
 			rest = append(rest, a)
@@ -52,7 +55,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := realMain(cmd, *db, *id, *budget, *crashAt, *linger, *failLarge); err != nil {
+	if err := realMain(cmd, *db, *id, *budget, *crashAt, *linger, *failLarge, *addr); err != nil {
 		if errors.Is(err, loom.ErrStaleEpoch) {
 			fmt.Fprintf(os.Stderr, "stale epoch: another process claimed instance %s; this process's appends were rejected (fencing working as designed)\n", *id)
 			os.Exit(3)
@@ -62,7 +65,7 @@ func main() {
 	}
 }
 
-func realMain(cmd, db, id string, budget float64, crashAt string, linger time.Duration, failLarge bool) error {
+func realMain(cmd, db, id string, budget float64, crashAt string, linger time.Duration, failLarge bool, addr string) error {
 	ctx := context.Background()
 	store, err := sqlite.Open(db)
 	if err != nil {
@@ -104,6 +107,10 @@ func realMain(cmd, db, id string, budget float64, crashAt string, linger time.Du
 
 	case "timeline":
 		return printTimeline(ctx, store, def, id)
+
+	case "inspect":
+		fmt.Printf("inspector on http://localhost%s (no auth — internal use only)\n", addr)
+		return inspector.Serve(ctx, addr, store, map[string]*loom.Definition{"triage": def})
 
 	case "run":
 		ticket := Ticket{From: "customer@example.com", Body: "I was double-charged on my last invoice, please refund the duplicate."}
