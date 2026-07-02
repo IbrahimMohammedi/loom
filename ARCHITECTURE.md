@@ -221,6 +221,18 @@ exists in all deployment modes. Two classes:
   state that expects it — `InstanceCreated` only as the log's first event,
   `StepResumed` only when suspended at that step.
 
+**Implementation note (surfaced deviation).** The store also carries a
+third write that is neither class: `SetStatus`, which updates the derived
+status *cache* (the `Runnable` index) without appending an event and
+without an epoch. This is not an exception to the taxonomy because the
+taxonomy governs the **log**, and `SetStatus` never touches the log — the
+cache is rebuildable from the fold and is never an input to it. The
+consequence is stated rather than hidden: a stale executor can lag the
+cache (its status write reflects a fold of a slightly older log), and the
+system self-heals because every drive recomputes status from the log it
+just loaded. Anything that must be *true* lives in events; anything that
+must be *fast to query* lives in the cache.
+
 **Why two classes.** A webhook-driven `Resume` has no claim; forcing it to
 claim would fence off a legitimately running executor as a side effect of a
 human click. The taxonomy also names "recorded external inputs" as a
@@ -287,14 +299,25 @@ deterministically.
 **Decision.** The harness re-executes steps against the recorded log:
 
 ```go
-harness := loom.NewReplayHarness(log,
-    loom.WithDeps(mockLLM, mockMailer),        // side effects behind interfaces — required
-    loom.TruncateAt("draft-reply", 1),         // or: loom.InjectFailure("send", ErrTimeout)
+harness := replay.New(log,
+    replay.WithLLM(mockLLM),           // the one engine-managed dependency
+    replay.TruncateAt("draft", 1),     // or: replay.InjectFailure("send", ErrTimeout)
 )
-result := harness.Run(currentDefinition)
-// result.Diverged, result.DivergedAt, result.Recorded, result.Replayed,
+result := harness.Run(defBuiltWithMockDeps)
+// result.Diverged, result.DivergedAt, per-step Recorded/Replayed,
 // result.StoppedAt (reason: awaiting-unrecorded-input), per-step Advisory flag
 ```
+
+**Implementation note (surfaced deviation).** The register originally
+sketched `WithDeps(mockLLM, mockMailer)` as harness options. Implementation
+showed that non-LLM dependencies are closed over at *definition
+construction* (steps capture them when the workflow is built), not
+registered with the engine — so the harness cannot inject them; only the
+LLM client is engine-managed and injectable via `WithLLM`. The
+mocked-side-effects rule therefore lands one layer earlier: **build the
+Definition passed to `Run` with mock dependencies.** Same constraint, moved
+to where the dependency seam actually lives. The exported test skeleton
+says exactly this in its TODOs.
 
 **Rule 1: side effects come from mocks; recorded external inputs replay from
 the log.** Re-execution reaching a suspension consults the log for the
