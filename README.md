@@ -49,38 +49,53 @@ Try it: `cd examples/triage && go build && ./triage run -crash-at draft && ./tri
 
 ## What you write
 
+Define workflows as **factory functions taking their dependencies**. This
+is Loom's one structural convention, and it's load-bearing: the replay
+harness substitutes mocks by re-building the definition through the same
+factory — a workflow that closes over package-level singletons cannot be
+replayed.
+
 ```go
-wf := loom.NewWorkflow("triage")
+type TriageDeps struct {
+    KB     KnowledgeBase // interfaces, so replay can hand in mocks
+    Mailer Mailer
+}
 
-wf.Step("classify", loom.Typed(func(ctx context.Context, sctx *loom.StepContext, t Ticket) (Classification, error) {
-    return Classification{Category: categorize(t.Body)}, nil
-}))
+func NewTriageWorkflow(deps TriageDeps) (*loom.Definition, error) {
+    wf := loom.NewWorkflow("triage")
 
-wf.Step("fetch-context", loom.Typed(func(ctx context.Context, sctx *loom.StepContext, c Classification) (TicketContext, error) {
-    return TicketContext{Category: c.Category, KB: kb.Lookup(c.Category)}, nil
-}))
+    wf.Step("classify", loom.Typed(func(ctx context.Context, sctx *loom.StepContext, t Ticket) (Classification, error) {
+        return Classification{Category: categorize(t.Body)}, nil
+    }))
 
-wf.LLMStep("draft", chain, loom.Typed(func(ctx context.Context, sctx *loom.StepContext, tc TicketContext) (Draft, error) {
-    resp, err := sctx.LLM().Complete(ctx, buildPrompt(tc)) // budget-guarded, fallback chain
-    if err != nil {
-        return Draft{}, err
-    }
-    return Draft{Body: resp.Text}, nil
-}))
+    wf.Step("fetch-context", loom.Typed(func(ctx context.Context, sctx *loom.StepContext, c Classification) (TicketContext, error) {
+        return TicketContext{Category: c.Category, KB: deps.KB.Lookup(c.Category)}, nil
+    }))
 
-wf.Approval("gate") // suspends; resumes via loom.Resume from your webhook
+    wf.LLMStep("draft", chain, loom.Typed(func(ctx context.Context, sctx *loom.StepContext, tc TicketContext) (Draft, error) {
+        resp, err := sctx.LLM().Complete(ctx, buildPrompt(tc)) // budget-guarded, fallback chain
+        if err != nil {
+            return Draft{}, err
+        }
+        return Draft{Body: resp.Text}, nil
+    }))
 
-wf.Step("send", loom.Typed(func(ctx context.Context, sctx *loom.StepContext, d loom.ApprovalDecision) (string, error) {
-    var draft Draft
-    sctx.Output("draft", &draft) // declared below; typos fail at startup
-    return "sent", mailer.Send(sctx.IdempotencyKey(), to, draft.Body)
-})).Reads("draft")
+    wf.Approval("gate") // suspends; resumes via loom.Resume from your webhook
 
-def, err := wf.Build() // duplicate names, bad Reads: registration errors, not runtime surprises
+    wf.Step("send", loom.Typed(func(ctx context.Context, sctx *loom.StepContext, d loom.ApprovalDecision) (string, error) {
+        var draft Draft
+        sctx.Output("draft", &draft) // declared below; typos fail at startup
+        return "sent", deps.Mailer.Send(sctx.IdempotencyKey(), to, draft.Body)
+    })).Reads("draft")
+
+    return wf.Build() // duplicate names, bad Reads: registration errors, not runtime surprises
+}
 ```
 
 Steps are ordinary Go functions with `ctx` first and typed inputs/outputs —
 `loom.Typed` owns the marshaling; your code never touches `json.RawMessage`.
+In production: `NewTriageWorkflow(TriageDeps{KB: realKB, Mailer: ses})`.
+In a replay test: the same call with mocks.
 
 | | jobs table + cron | Loom | neither |
 |---|---|---|---|
@@ -150,8 +165,9 @@ h := replay.New(fixture.Events,
 res, _ := h.Run(def) // res.Diverged, res.DivergedAt, res.StoppedAt
 ```
 
-Two rules make it work: **side effects come from mocks** (build the
-definition with mock deps — the same injectable seam the demo runs on), and
+Two rules make it work: **side effects come from mocks** (call your
+workflow factory with mock deps — the convention above is what makes this
+possible), and
 **recorded external inputs replay from the log** (the approval decision a
 human made in production feeds back in; nobody mocks the human). LLM step
 outputs are compared structurally, not byte-wise — replay regression-tests

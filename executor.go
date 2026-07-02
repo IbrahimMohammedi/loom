@@ -273,6 +273,7 @@ func (d *driver) run(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	parkedAt := ""
 	for {
 		events, err := d.store.Load(ctx, id)
 		if err != nil {
@@ -313,7 +314,23 @@ func (d *driver) run(ctx context.Context, id string) error {
 					continue
 				}
 			}
-			return d.store.SetStatus(ctx, id, StatusSuspended, nil)
+			if parkedAt == p.Step {
+				return nil
+			}
+			// Park, then re-fold once: a Resume racing this SetStatus
+			// (webhook goroutine, no claim) applied status=running
+			// atomically with its append; writing suspended over it would
+			// wedge the instance — the cache says unclaimable, the log
+			// holds a resume, and a retried Resume is first-wins and does
+			// not re-apply meta. Re-folding sees any resume that landed
+			// before our write and continues the drive; one that lands
+			// after our write wins the cache and the acquisition loop
+			// picks it up. Every interleaving is live.
+			if err := d.store.SetStatus(ctx, id, StatusSuspended, nil); err != nil {
+				return err
+			}
+			parkedAt = p.Step
+			continue
 
 		case PrescribeFinalizeResume:
 			sd := def.steps[def.index[p.Step]]

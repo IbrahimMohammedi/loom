@@ -233,6 +233,35 @@ system self-heals because every drive recomputes status from the log it
 just loaded. Anything that must be *true* lives in events; anything that
 must be *fast to query* lives in the cache.
 
+**The liveness answer (post-MVP reconciliation).** The acquisition loop's
+`Runnable` query **does** filter on the status cache — so cache wrongness
+in the unclaimable direction would be a permanent wedge, and the question
+deserves a proof, not a shrug. Crash-torn writes are safe by construction:
+every append that moves an instance *toward* unclaimable (`StepSuspended`,
+`StepResumed`) carries its `MetaUpdate` in the same store transaction, and
+every SetStatus-only transition (terminal, `waiting_retry`,
+`incompatible`, and the await-resume park) moves *from* a claimable
+status — a crash before the write leaves the instance claimable, and the
+next drive re-folds and re-writes it. Tested by simulating the torn write
+at the store layer and asserting a restarted acquisition loop still
+completes the instance.
+
+Tracing the interleavings surfaced one genuine hole — concurrency, not
+crash: a webhook `Resume` (no claim, constrained append, atomically sets
+`running`) can land between the driver's fold and the driver's
+`SetStatus(suspended)` park; the park then overwrites `running`, the cache
+says unclaimable while the log holds a resume, and a retried `Resume` is
+first-wins and does not re-apply meta — wedged forever, even
+single-process. **Fix: the driver re-folds once after parking.** A resume
+that landed before the park is visible to the re-fold and the drive
+continues; one that lands after the park wins the cache write and the
+acquisition loop picks it up — every interleaving is live. This was chosen
+over the two repair-side alternatives (deriving `Runnable` from the log:
+a fold of every instance per tick; a periodic reconciliation sweep: new
+machinery plus a staleness bound) because it prevents the wedge at the
+point of the race instead of repairing it later. Tested by a store wrapper
+that deterministically injects the resume inside the park's write.
+
 **Why two classes.** A webhook-driven `Resume` has no claim; forcing it to
 claim would fence off a legitimately running executor as a side effect of a
 human click. The taxonomy also names "recorded external inputs" as a
@@ -351,15 +380,26 @@ LLM call.
 **Decision.** The embedded HTTP inspector ships: a timeline view over the
 fold (per-step status, attempts, timestamps, `notBefore` countdowns); status
 surfacing for the states this design manufactures (`suspended`,
-`incompatible` with both hashes shown, `budget_exhausted`, terminal-with-
-status); orphaned-reservation display with crash-orphaned audit events and a
-release/bookkeeping action; manual `Resume` for suspended instances (same
+`incompatible` with the recomputed reason shown, `budget_exhausted`,
+terminal-with-status); orphaned-reservation display with crash-orphaned
+audit events; manual `Resume` for suspended instances (same
 constrained-append path as the webhook); and **export-as-replay-test** —
 download the instance's event log as a fixture plus a generated Go test
-skeleton (`NewReplayHarness` pre-wired, `TruncateAt` defaulted to the
-failed/suspended step, mock stubs for the definition's declared
-dependencies). The button's job: teleport a production incident into a
-failing local test.
+skeleton containing the fixture load, a `replay.New` call with `TruncateAt`
+defaulted to the incident (failed or suspended) step, a mock LLM wired
+through the harness-injectable `WithLLM` seam, and an explicit TODO block
+where the user constructs their definition via their own factory with their
+own mocks. The skeleton cannot pre-wire non-LLM dependency stubs: per
+ADR-11's implementation note, those are closed over at definition
+construction behind the user's factory signature, which the exporter cannot
+know. The button's job: teleport a production incident into a failing local
+test.
+
+**Superseded within this register.** The stale-reservation *release action*
+promised during design review was consumed by ADR-6's settle-at-max
+decision: crash-orphaned reservations are settled automatically by the
+resuming executor, so there is nothing left to release, and the audit-trail
+display (the `crash-orphaned` ledger lines) supersedes the action.
 
 **Rejected.** (a) In-process re-execution with real deps: re-sends emails
 and re-spends tokens from a UI click — a re-run wearing a replay costume.
@@ -400,6 +440,22 @@ and the replay exporter may consume them later.
 **Stated limitation.** Output schema drift between steps remains a runtime
 concern; Go generics cannot express heterogeneous pipeline typing without
 code generation, which is out of MVP scope.
+
+**The factory convention (load-bearing, not style).** Workflows are defined
+by factory functions that take their dependencies:
+
+```go
+func NewTriageWorkflow(deps TriageDeps) (*loom.Definition, error)
+```
+
+This is required, not recommended, and the reason is testability: per
+ADR-11's implementation note, non-LLM dependencies are closed over at
+definition construction, so the replay harness can only substitute mocks by
+re-Building the definition through the same factory with mock arguments.
+A workflow that closes over package-level singletons cannot be replayed —
+the user discovers this at test-writing time unless the convention is
+stated up front, so it is stated in the README's getting-started example
+and in the exported test skeleton's TODOs.
 
 ## ADR-14: Pure-Go SQLite (modernc.org/sqlite)
 
@@ -532,7 +588,7 @@ loom/store/sqlite/        pure-Go SQLite implementation (ADR-14)
 loom/replay/              NewReplayHarness, injection, comparators, exporter-
                           consumed fixtures (ADR-11)
 loom/inspector/           embedded HTTP UI: timeline, statuses, resume,
-                          reservation release, export-as-replay-test (ADR-12)
+                          orphan audit trail, export-as-replay-test (ADR-12)
 
 docs/design-grilling.md   condensed transcript of the four-round design
                           review that produced this register
